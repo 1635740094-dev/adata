@@ -64,14 +64,6 @@ class StockMarketEast(StockMarketTemplate):
                                               '', "change_pct", "change", "turnover_ratio"])
         # 4.清洗数据
         df['pre_close'] = df['close'] - df['change']
-        df['pre_close'] = df['pre_close'].round(2)
-        df['volume'] = df['volume'].astype(int) * 100
-        df['trade_time'] = pd.to_datetime(df['trade_date']).dt.strftime('%Y-%m-%d %H:%M:%S')
-        df['trade_date'] = pd.to_datetime(df['trade_date']).dt.strftime('%Y-%m-%d')
-        df['stock_code'] = stock_code
-        numeric_columns = ['open', 'close', 'volume', 'high', 'low', 'amount', 'change', 'change_pct',
-                           'turnover_ratio', 'pre_close']
-        df[numeric_columns] = df[numeric_columns].apply(pd.to_numeric)
         df.reset_index(inplace=True, drop=True)
         return df[['stock_code', 'trade_time', "trade_date", "open", "close", "high", "low", "volume", "amount",
                    "change_pct", "change", "turnover_ratio", "pre_close"]]
