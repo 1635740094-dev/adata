@@ -10,6 +10,8 @@
 
 import threading
 import time
+from urllib.parse import urlparse
+from collections import defaultdict, deque
 
 import requests
 
@@ -41,10 +43,162 @@ class SunProxy(object):
             del cls._data[key]
 
 
+class RateLimiter:
+    """
+    基于域名的频率限制器
+    默认每分钟每个域名最多30次请求
+    """
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._init()
+        return cls._instance
+
+    def _init(self):
+        # 每个域名的请求时间队列 {domain: deque([timestamp, ...])}
+        self._domain_requests = defaultdict(deque)
+        # 每个域名的限制配置 {domain: {'max_requests': int, 'window_seconds': int}}
+        self._domain_limits = {}
+        # 默认限制: 每分钟30次
+        self._default_max_requests = 30
+        self._default_window_seconds = 60
+        self._config_lock = threading.Lock()
+
+    def set_limit(self, domain: str, max_requests: int = 30, window_seconds: int = 60):
+        """
+        设置指定域名的频率限制
+        :param domain: 域名，如 'eastmoney.com'
+        :param max_requests: 在窗口时间内最大请求次数
+        :param window_seconds: 时间窗口（秒）
+        """
+        with self._config_lock:
+            self._domain_limits[domain] = {
+                'max_requests': max_requests,
+                'window_seconds': window_seconds
+            }
+
+    def set_default_limit(self, max_requests: int = 30, window_seconds: int = 60):
+        """
+        设置默认的频率限制
+        :param max_requests: 在窗口时间内最大请求次数
+        :param window_seconds: 时间窗口（秒）
+        """
+        self._default_max_requests = max_requests
+        self._default_window_seconds = window_seconds
+
+    def _get_domain_from_url(self, url: str) -> str:
+        """从URL中提取域名"""
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower()
+            # 移除端口号
+            if ':' in domain:
+                domain = domain.split(':')[0]
+            return domain
+        except Exception:
+            return url.lower()
+
+    def _get_limit(self, domain: str) -> tuple:
+        """获取域名的限制配置"""
+        with self._config_lock:
+            if domain in self._domain_limits:
+                config = self._domain_limits[domain]
+                return config['max_requests'], config['window_seconds']
+        return self._default_max_requests, self._default_window_seconds
+
+    def acquire(self, url: str) -> float:
+        """
+        获取请求许可，如果超限则等待
+        :param url: 请求的URL
+        :return: 实际等待的时间（秒）
+        """
+        domain = self._get_domain_from_url(url)
+        max_requests, window_seconds = self._get_limit(domain)
+
+        with self._config_lock:
+            now = time.time()
+            requests_queue = self._domain_requests[domain]
+
+            # 清理过期的请求记录
+            while requests_queue and requests_queue[0] < now - window_seconds:
+                requests_queue.popleft()
+
+            # 检查是否需要等待
+            if len(requests_queue) >= max_requests:
+                # 需要等待直到最早的请求过期
+                wait_time = requests_queue[0] + window_seconds - now
+                if wait_time > 0:
+                    return wait_time
+
+            # 记录当前请求
+            requests_queue.append(now)
+            return 0
+
+    def get_status(self, url: str = None) -> dict:
+        """
+        获取频率限制状态
+        :param url: 如果提供URL，则返回该域名的状态；否则返回所有域名的状态
+        :return: 状态字典
+        """
+        with self._config_lock:
+            now = time.time()
+            if url:
+                domain = self._get_domain_from_url(url)
+                max_requests, window_seconds = self._get_limit(domain)
+                requests_queue = self._domain_requests.get(domain, deque())
+                # 清理过期记录
+                valid_requests = [t for t in requests_queue if t >= now - window_seconds]
+                return {
+                    'domain': domain,
+                    'current_requests': len(valid_requests),
+                    'max_requests': max_requests,
+                    'window_seconds': window_seconds,
+                    'remaining': max(0, max_requests - len(valid_requests))
+                }
+            else:
+                result = {}
+                for domain, requests_queue in self._domain_requests.items():
+                    max_requests, window_seconds = self._get_limit(domain)
+                    valid_requests = [t for t in requests_queue if t >= now - window_seconds]
+                    result[domain] = {
+                        'current_requests': len(valid_requests),
+                        'max_requests': max_requests,
+                        'window_seconds': window_seconds,
+                        'remaining': max(0, max_requests - len(valid_requests))
+                    }
+                return result
+
+
 class SunRequests(object):
     def __init__(self, sun_proxy: SunProxy = None) -> None:
         super().__init__()
         self.sun_proxy = sun_proxy
+        self._rate_limiter = RateLimiter()
+
+    def set_rate_limit(self, domain: str = None, max_requests: int = 30, window_seconds: int = 60):
+        """
+        设置频率限制
+        :param domain: 域名，如 'eastmoney.com'；如果为None则设置默认限制
+        :param max_requests: 在窗口时间内最大请求次数
+        :param window_seconds: 时间窗口（秒）
+        """
+        if domain:
+            self._rate_limiter.set_limit(domain, max_requests, window_seconds)
+        else:
+            self._rate_limiter.set_default_limit(max_requests, window_seconds)
+
+    def get_rate_limit_status(self, url: str = None) -> dict:
+        """
+        获取频率限制状态
+        :param url: 如果提供URL，则返回该域名的状态；否则返回所有域名的状态
+        :return: 状态字典
+        """
+        return self._rate_limiter.get_status(url)
 
     def request(self, method='get', url=None, times=3, retry_wait_time=1588, proxies=None, wait_time=None, **kwargs):
         """
@@ -58,6 +212,12 @@ class SunRequests(object):
         :param kwargs: 其它 requests 参数，用法相同
         :return: res
         """
+        # 0. 频率限制检查
+        if url:
+            rate_limit_wait = self._rate_limiter.acquire(url)
+            if rate_limit_wait > 0:
+                time.sleep(rate_limit_wait)
+
         # 1. 获取设置代理
         proxies = self.__get_proxies(proxies)
         # 2. 请求数据结果
